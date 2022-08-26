@@ -231,6 +231,11 @@ impl<'a, R: Read> Entry<'a, R> {
         self.fields.unpack_in(dst.as_ref())
     }
 
+    /// Document me
+    pub fn consume_and_checksum(&mut self) -> io::Result<u32> {
+        self.fields.consume_and_checksum()
+    }
+
     /// Indicate whether extended file attributes (xattrs on Unix) are preserved
     /// when unpacking this entry.
     ///
@@ -314,9 +319,9 @@ impl<'a> EntryFields<'a> {
     }
 
     /// Gets the path in a "lossy" way, used for error reporting ONLY.
-    fn path_lossy(&self) -> String {
-        String::from_utf8_lossy(&self.path_bytes()).to_string()
-    }
+    // fn path_lossy(&self) -> String {
+    //     String::from_utf8_lossy(&self.path_bytes()).to_string()
+    // }
 
     fn link_name(&self) -> io::Result<Option<Cow<Path>>> {
         match self.link_name_bytes() {
@@ -363,7 +368,7 @@ impl<'a> EntryFields<'a> {
         )))
     }
 
-    fn unpack_in(&mut self, dst: &Path) -> io::Result<bool> {
+    fn validate_unpack_in(&mut self, dst: &Path) -> Option<(PathBuf, PathBuf)> {
         // Notes regarding bsdtar 2.8.3 / libarchive 2.8.3:
         // * Leading '/'s are trimmed. For example, `///test` is treated as
         //   `test`.
@@ -379,12 +384,7 @@ impl<'a> EntryFields<'a> {
 
         let mut file_dst = dst.to_path_buf();
         {
-            let path = self.path().map_err(|e| {
-                TarError::new(
-                    format!("invalid path in entry header: {}", self.path_lossy()),
-                    e,
-                )
-            })?;
+            let path = self.path().ok()?;
             for part in path.components() {
                 match part {
                     // Leading '/' characters, root paths, and '.'
@@ -396,7 +396,7 @@ impl<'a> EntryFields<'a> {
                     // unpacking the file to prevent directory traversal
                     // security issues.  See, e.g.: CVE-2001-1267,
                     // CVE-2002-0399, CVE-2005-1918, CVE-2007-4131
-                    Component::ParentDir => return Ok(false),
+                    Component::ParentDir => return None,
 
                     Component::Normal(part) => file_dst.push(part),
                 }
@@ -406,19 +406,76 @@ impl<'a> EntryFields<'a> {
         // Skip cases where only slashes or '.' parts were seen, because
         // this is effectively an empty filename.
         if *dst == *file_dst {
-            return Ok(true);
+            return None;
         }
 
         // Skip entries without a parent (i.e. outside of FS root)
         let parent = match file_dst.parent() {
             Some(p) => p,
+            None => return None,
+        };
+
+        Some((file_dst.to_path_buf(), parent.to_path_buf()))
+    }
+
+    fn consume_and_checksum(&mut self) -> io::Result<u32> {
+        let kind = self.header.entry_type();
+        if kind.is_dir()
+            || kind.is_hard_link()
+            || kind.is_symlink()
+            || kind.is_pax_global_extensions()
+            || kind.is_pax_local_extensions()
+            || kind.is_gnu_longname()
+            || kind.is_gnu_longlink()
+        {
+            return self.header.cksum();
+        }
+        if self.header.as_ustar().is_none() && self.path_bytes().ends_with(b"/") {
+            return self.header.cksum();
+        }
+
+        let mut hasher = crc32fast::Hasher::new();
+        for io in self.data.drain(..) {
+            match io {
+                EntryIo::Data(mut d) => {
+                    let expected = d.limit();
+                    let mut calculated = 0;
+                    let mut buffer = [0; 1024 * 1024];
+                    loop {
+                        let count = d.read(&mut buffer)?;
+                        calculated += count as u64;
+                        if count == 0 || calculated > expected {
+                            break;
+                        }
+                        hasher.update(&buffer[..count]);
+                    }
+
+                    if calculated != expected {
+                        return Err(other("failed to write entire file"));
+                    }
+                }
+                EntryIo::Pad(_d) => {
+                    // Noop
+                    // This may not be correct, and is TBD. Unclear what creates the
+                    // EntryIo::Pad and whether that's actually padding that matetrs
+                    // in the file
+                }
+            }
+        }
+
+        Ok(hasher.finalize())
+    }
+
+    fn unpack_in(&mut self, dst: &Path) -> io::Result<bool> {
+        let (file_dst, parent) = match self.validate_unpack_in(dst) {
+            Some(valid) => valid,
             None => return Ok(false),
         };
 
-        self.ensure_dir_created(&dst, parent)
+        ensure_dir_created(&dst, &parent)
             .map_err(|e| TarError::new(format!("failed to create `{}`", parent.display()), e))?;
 
-        let canon_target = self.validate_inside_dst(&dst, parent)?;
+        let canon_target = validate_inside_dst(&dst, &parent)?;
 
         self.unpack(Some(&canon_target), &file_dst)
             .map_err(|e| TarError::new(format!("failed to unpack `{}`", file_dst.display()), e))?;
@@ -445,38 +502,6 @@ impl<'a> EntryFields<'a> {
 
     /// Returns access to the header of this entry in the archive.
     fn unpack(&mut self, target_base: Option<&Path>, dst: &Path) -> io::Result<Unpacked> {
-        fn set_perms_ownerships(
-            dst: &Path,
-            f: Option<&mut std::fs::File>,
-            header: &Header,
-            perms: bool,
-            ownerships: bool,
-        ) -> io::Result<()> {
-            // ownerships need to be set first to avoid stripping SUID bits in the permissions ...
-            if ownerships {
-                set_ownerships(dst, &f, header.uid()?, header.gid()?)?;
-            }
-            // ... then set permissions, SUID bits set here is kept
-            if let Ok(mode) = header.mode() {
-                set_perms(dst, f, mode, perms)?;
-            }
-
-            Ok(())
-        }
-
-        fn get_mtime(header: &Header) -> Option<FileTime> {
-            header.mtime().ok().map(|mtime| {
-                // For some more information on this see the comments in
-                // `Header::fill_platform_from`, but the general idea is that
-                // we're trying to avoid 0-mtime files coming out of archives
-                // since some tools don't ingest them well. Perhaps one day
-                // when Cargo stops working with 0-mtime archives we can remove
-                // this.
-                let mtime = if mtime == 0 { 1 } else { mtime };
-                FileTime::from_unix_time(mtime as i64, 0)
-            })
-        }
-
         let kind = self.header.entry_type();
 
         if kind.is_dir() {
@@ -522,7 +547,7 @@ impl<'a> EntryFields<'a> {
                     // so we need to validate at this time.
                     Some(ref p) => {
                         let link_src = p.join(src);
-                        self.validate_inside_dst(p, &link_src)?;
+                        validate_inside_dst(p, &link_src)?;
                         link_src
                     }
                     None => src.into_owned(),
@@ -539,11 +564,11 @@ impl<'a> EntryFields<'a> {
                     )
                 })?;
             } else {
-                symlink(&src, dst)
+                imp::symlink(&src, dst)
                     .or_else(|err_io| {
                         if err_io.kind() == io::ErrorKind::AlreadyExists && self.overwrite {
                             // remove dest and try once more
-                            std::fs::remove_file(dst).and_then(|()| symlink(&src, dst))
+                            std::fs::remove_file(dst).and_then(|()| imp::symlink(&src, dst))
                         } else {
                             Err(err_io)
                         }
@@ -568,22 +593,6 @@ impl<'a> EntryFields<'a> {
                 }
             }
             return Ok(Unpacked::__Nonexhaustive);
-
-            #[cfg(target_arch = "wasm32")]
-            #[allow(unused_variables)]
-            fn symlink(src: &Path, dst: &Path) -> io::Result<()> {
-                Err(io::Error::new(io::ErrorKind::Other, "Not implemented"))
-            }
-
-            #[cfg(windows)]
-            fn symlink(src: &Path, dst: &Path) -> io::Result<()> {
-                ::std::os::windows::fs::symlink_file(src, dst)
-            }
-
-            #[cfg(unix)]
-            fn symlink(src: &Path, dst: &Path) -> io::Result<()> {
-                ::std::os::unix::fs::symlink(src, dst)
-            }
         } else if kind.is_pax_global_extensions()
             || kind.is_pax_local_extensions()
             || kind.is_gnu_longname()
@@ -683,244 +692,6 @@ impl<'a> EntryFields<'a> {
             set_xattrs(self, dst)?;
         }
         return Ok(Unpacked::File(f));
-
-        fn set_ownerships(
-            dst: &Path,
-            f: &Option<&mut std::fs::File>,
-            uid: u64,
-            gid: u64,
-        ) -> Result<(), TarError> {
-            _set_ownerships(dst, f, uid, gid).map_err(|e| {
-                TarError::new(
-                    format!(
-                        "failed to set ownerships to uid={:?}, gid={:?} \
-                         for `{}`",
-                        uid,
-                        gid,
-                        dst.display()
-                    ),
-                    e,
-                )
-            })
-        }
-
-        #[cfg(unix)]
-        fn _set_ownerships(
-            dst: &Path,
-            f: &Option<&mut std::fs::File>,
-            uid: u64,
-            gid: u64,
-        ) -> io::Result<()> {
-            use std::convert::TryInto;
-            use std::os::unix::prelude::*;
-
-            let uid: libc::uid_t = uid.try_into().map_err(|_| {
-                io::Error::new(io::ErrorKind::Other, format!("UID {} is too large!", uid))
-            })?;
-            let gid: libc::gid_t = gid.try_into().map_err(|_| {
-                io::Error::new(io::ErrorKind::Other, format!("GID {} is too large!", gid))
-            })?;
-            match f {
-                Some(f) => unsafe {
-                    let fd = f.as_raw_fd();
-                    if libc::fchown(fd, uid, gid) != 0 {
-                        Err(io::Error::last_os_error())
-                    } else {
-                        Ok(())
-                    }
-                },
-                None => unsafe {
-                    let path = std::ffi::CString::new(dst.as_os_str().as_bytes()).map_err(|e| {
-                        io::Error::new(
-                            io::ErrorKind::Other,
-                            format!("path contains null character: {:?}", e),
-                        )
-                    })?;
-                    if libc::lchown(path.as_ptr(), uid, gid) != 0 {
-                        Err(io::Error::last_os_error())
-                    } else {
-                        Ok(())
-                    }
-                },
-            }
-        }
-
-        // Windows does not support posix numeric ownership IDs
-        #[cfg(any(windows, target_arch = "wasm32"))]
-        fn _set_ownerships(
-            _: &Path,
-            _: &Option<&mut std::fs::File>,
-            _: u64,
-            _: u64,
-        ) -> io::Result<()> {
-            Ok(())
-        }
-
-        fn set_perms(
-            dst: &Path,
-            f: Option<&mut std::fs::File>,
-            mode: u32,
-            preserve: bool,
-        ) -> Result<(), TarError> {
-            _set_perms(dst, f, mode, preserve).map_err(|e| {
-                TarError::new(
-                    format!(
-                        "failed to set permissions to {:o} \
-                         for `{}`",
-                        mode,
-                        dst.display()
-                    ),
-                    e,
-                )
-            })
-        }
-
-        #[cfg(unix)]
-        fn _set_perms(
-            dst: &Path,
-            f: Option<&mut std::fs::File>,
-            mode: u32,
-            preserve: bool,
-        ) -> io::Result<()> {
-            use std::os::unix::prelude::*;
-
-            let mode = if preserve { mode } else { mode & 0o777 };
-            let perm = fs::Permissions::from_mode(mode as _);
-            match f {
-                Some(f) => f.set_permissions(perm),
-                None => fs::set_permissions(dst, perm),
-            }
-        }
-
-        #[cfg(windows)]
-        fn _set_perms(
-            dst: &Path,
-            f: Option<&mut std::fs::File>,
-            mode: u32,
-            _preserve: bool,
-        ) -> io::Result<()> {
-            if mode & 0o200 == 0o200 {
-                return Ok(());
-            }
-            match f {
-                Some(f) => {
-                    let mut perm = f.metadata()?.permissions();
-                    perm.set_readonly(true);
-                    f.set_permissions(perm)
-                }
-                None => {
-                    let mut perm = fs::metadata(dst)?.permissions();
-                    perm.set_readonly(true);
-                    fs::set_permissions(dst, perm)
-                }
-            }
-        }
-
-        #[cfg(target_arch = "wasm32")]
-        #[allow(unused_variables)]
-        fn _set_perms(
-            dst: &Path,
-            f: Option<&mut std::fs::File>,
-            mode: u32,
-            _preserve: bool,
-        ) -> io::Result<()> {
-            Err(io::Error::new(io::ErrorKind::Other, "Not implemented"))
-        }
-
-        #[cfg(all(unix, feature = "xattr"))]
-        fn set_xattrs(me: &mut EntryFields, dst: &Path) -> io::Result<()> {
-            use std::ffi::OsStr;
-            use std::os::unix::prelude::*;
-
-            let exts = match me.pax_extensions() {
-                Ok(Some(e)) => e,
-                _ => return Ok(()),
-            };
-            let exts = exts
-                .filter_map(|e| e.ok())
-                .filter_map(|e| {
-                    let key = e.key_bytes();
-                    let prefix = b"SCHILY.xattr.";
-                    if key.starts_with(prefix) {
-                        Some((&key[prefix.len()..], e))
-                    } else {
-                        None
-                    }
-                })
-                .map(|(key, e)| (OsStr::from_bytes(key), e.value_bytes()));
-
-            for (key, value) in exts {
-                xattr::set(dst, key, value).map_err(|e| {
-                    TarError::new(
-                        format!(
-                            "failed to set extended \
-                             attributes to {}. \
-                             Xattrs: key={:?}, value={:?}.",
-                            dst.display(),
-                            key,
-                            String::from_utf8_lossy(value)
-                        ),
-                        e,
-                    )
-                })?;
-            }
-
-            Ok(())
-        }
-        // Windows does not completely support posix xattrs
-        // https://en.wikipedia.org/wiki/Extended_file_attributes#Windows_NT
-        #[cfg(any(windows, not(feature = "xattr"), target_arch = "wasm32"))]
-        fn set_xattrs(_: &mut EntryFields, _: &Path) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    fn ensure_dir_created(&self, dst: &Path, dir: &Path) -> io::Result<()> {
-        let mut ancestor = dir;
-        let mut dirs_to_create = Vec::new();
-        while ancestor.symlink_metadata().is_err() {
-            dirs_to_create.push(ancestor);
-            if let Some(parent) = ancestor.parent() {
-                ancestor = parent;
-            } else {
-                break;
-            }
-        }
-        for ancestor in dirs_to_create.into_iter().rev() {
-            if let Some(parent) = ancestor.parent() {
-                self.validate_inside_dst(dst, parent)?;
-            }
-            fs::create_dir_all(ancestor)?;
-        }
-        Ok(())
-    }
-
-    fn validate_inside_dst(&self, dst: &Path, file_dst: &Path) -> io::Result<PathBuf> {
-        // Abort if target (canonical) parent is outside of `dst`
-        let canon_parent = file_dst.canonicalize().map_err(|err| {
-            Error::new(
-                err.kind(),
-                format!("{} while canonicalizing {}", err, file_dst.display()),
-            )
-        })?;
-        let canon_target = dst.canonicalize().map_err(|err| {
-            Error::new(
-                err.kind(),
-                format!("{} while canonicalizing {}", err, dst.display()),
-            )
-        })?;
-        if !canon_parent.starts_with(&canon_target) {
-            let err = TarError::new(
-                format!(
-                    "trying to unpack outside of destination path: {}",
-                    canon_target.display()
-                ),
-                // TODO: use ErrorKind::InvalidInput here? (minor breaking change)
-                Error::new(ErrorKind::Other, "Invalid argument"),
-            );
-            return Err(err.into());
-        }
-        Ok(canon_target)
     }
 }
 
@@ -943,6 +714,292 @@ impl<'a> Read for EntryIo<'a> {
         match *self {
             EntryIo::Pad(ref mut io) => io.read(into),
             EntryIo::Data(ref mut io) => io.read(into),
+        }
+    }
+}
+
+fn ensure_dir_created(dst: &Path, dir: &Path) -> io::Result<()> {
+    let mut ancestor = dir;
+    let mut dirs_to_create = Vec::new();
+    while ancestor.symlink_metadata().is_err() {
+        dirs_to_create.push(ancestor);
+        if let Some(parent) = ancestor.parent() {
+            ancestor = parent;
+        } else {
+            break;
+        }
+    }
+    for ancestor in dirs_to_create.into_iter().rev() {
+        if let Some(parent) = ancestor.parent() {
+            validate_inside_dst(dst, parent)?;
+        }
+        fs::create_dir_all(ancestor)?;
+    }
+    Ok(())
+}
+
+fn validate_inside_dst(dst: &Path, file_dst: &Path) -> io::Result<PathBuf> {
+    // Abort if target (canonical) parent is outside of `dst`
+    let canon_parent = file_dst.canonicalize().map_err(|err| {
+        Error::new(
+            err.kind(),
+            format!("{} while canonicalizing {}", err, file_dst.display()),
+        )
+    })?;
+    let canon_target = dst.canonicalize().map_err(|err| {
+        Error::new(
+            err.kind(),
+            format!("{} while canonicalizing {}", err, dst.display()),
+        )
+    })?;
+    if !canon_parent.starts_with(&canon_target) {
+        let err = TarError::new(
+            format!(
+                "trying to unpack outside of destination path: {}",
+                canon_target.display()
+            ),
+            // TODO: use ErrorKind::InvalidInput here? (minor breaking change)
+            Error::new(ErrorKind::Other, "Invalid argument"),
+        );
+        return Err(err.into());
+    }
+    Ok(canon_target)
+}
+
+fn set_perms_ownerships(
+    dst: &Path,
+    f: Option<&mut std::fs::File>,
+    header: &Header,
+    perms: bool,
+    ownerships: bool,
+) -> io::Result<()> {
+    // ownerships need to be set first to avoid stripping SUID bits in the permissions ...
+    if ownerships {
+        set_ownerships(dst, &f, header.uid()?, header.gid()?)?;
+    }
+    // ... then set permissions, SUID bits set here is kept
+    if let Ok(mode) = header.mode() {
+        set_perms(dst, f, mode, perms)?;
+    }
+
+    Ok(())
+}
+
+fn get_mtime(header: &Header) -> Option<FileTime> {
+    header.mtime().ok().map(|mtime| {
+        // For some more information on this see the comments in
+        // `Header::fill_platform_from`, but the general idea is that
+        // we're trying to avoid 0-mtime files coming out of archives
+        // since some tools don't ingest them well. Perhaps one day
+        // when Cargo stops working with 0-mtime archives we can remove
+        // this.
+        let mtime = if mtime == 0 { 1 } else { mtime };
+        FileTime::from_unix_time(mtime as i64, 0)
+    })
+}
+
+fn set_ownerships(
+    dst: &Path,
+    f: &Option<&mut std::fs::File>,
+    uid: u64,
+    gid: u64,
+) -> Result<(), TarError> {
+    imp::set_ownerships(dst, f, uid, gid).map_err(|e| {
+        TarError::new(
+            format!(
+                "failed to set ownerships to uid={:?}, gid={:?} \
+                 for `{}`",
+                uid,
+                gid,
+                dst.display()
+            ),
+            e,
+        )
+    })
+}
+
+fn set_perms(
+    dst: &Path,
+    f: Option<&mut std::fs::File>,
+    mode: u32,
+    preserve: bool,
+) -> Result<(), TarError> {
+    imp::set_perms(dst, f, mode, preserve).map_err(|e| {
+        TarError::new(
+            format!(
+                "failed to set permissions to {:o} \
+                    for `{}`",
+                mode,
+                dst.display()
+            ),
+            e,
+        )
+    })
+}
+
+#[cfg(all(unix, feature = "xattr"))]
+fn set_xattrs(me: &mut EntryFields, dst: &Path) -> io::Result<()> {
+    use std::{ffi::OsStr, os::unix::prelude::OsStrExt};
+
+    let exts = match me.pax_extensions() {
+        Ok(Some(e)) => e,
+        _ => return Ok(()),
+    };
+    let exts = exts
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let key = e.key_bytes();
+            let prefix = b"SCHILY.xattr.";
+            if key.starts_with(prefix) {
+                Some((&key[prefix.len()..], e))
+            } else {
+                None
+            }
+        })
+        .map(|(key, e)| (OsStr::from_bytes(key), e.value_bytes()));
+
+    for (key, value) in exts {
+        xattr::set(dst, key, value).map_err(|e| {
+            TarError::new(
+                format!(
+                    "failed to set extended \
+                        attributes to {}. \
+                        Xattrs: key={:?}, value={:?}.",
+                    dst.display(),
+                    key,
+                    String::from_utf8_lossy(value)
+                ),
+                e,
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+#[cfg(any(windows, not(feature = "xattr"), target_arch = "wasm32"))]
+fn set_xattrs(_: &mut EntryFields, _: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+mod imp {
+    use std::{
+        convert::TryInto,
+        fs, io,
+        os::unix::prelude::{PermissionsExt, *},
+        path::Path,
+    };
+
+    #[cfg(unix)]
+    pub(super) fn symlink(src: &Path, dst: &Path) -> io::Result<()> {
+        ::std::os::unix::fs::symlink(src, dst)
+    }
+
+    pub(super) fn set_ownerships(
+        dst: &Path,
+        f: &Option<&mut std::fs::File>,
+        uid: u64,
+        gid: u64,
+    ) -> io::Result<()> {
+        let uid: libc::uid_t = uid.try_into().map_err(|_| {
+            io::Error::new(io::ErrorKind::Other, format!("UID {} is too large!", uid))
+        })?;
+        let gid: libc::gid_t = gid.try_into().map_err(|_| {
+            io::Error::new(io::ErrorKind::Other, format!("GID {} is too large!", gid))
+        })?;
+        match f {
+            Some(f) => unsafe {
+                let fd = f.as_raw_fd();
+                if libc::fchown(fd, uid, gid) != 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            },
+            None => unsafe {
+                let path = std::ffi::CString::new(dst.as_os_str().as_bytes()).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("path contains null character: {:?}", e),
+                    )
+                })?;
+                if libc::lchown(path.as_ptr(), uid, gid) != 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            },
+        }
+    }
+
+    pub(super) fn set_perms(
+        dst: &Path,
+        f: Option<&mut std::fs::File>,
+        mode: u32,
+        preserve: bool,
+    ) -> io::Result<()> {
+        let mode = if preserve { mode } else { mode & 0o777 };
+        let perm = fs::Permissions::from_mode(mode as _);
+        match f {
+            Some(f) => f.set_permissions(perm),
+            None => fs::set_permissions(dst, perm),
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+mod imp {
+    #[allow(unused_variables)]
+    pub(super) fn symlink(src: &Path, dst: &Path) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Other, "Not implemented"))
+    }
+
+    fn set_ownerships(_: &Path, _: &Option<&mut std::fs::File>, _: u64, _: u64) -> io::Result<()> {
+        Ok(())
+    }
+
+    #[allow(unused_variables)]
+    fn _set_perms(
+        dst: &Path,
+        f: Option<&mut std::fs::File>,
+        mode: u32,
+        _preserve: bool,
+    ) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Other, "Not implemented"))
+    }
+}
+
+#[cfg(windows)]
+mod imp {
+    pub(super) fn symlink(src: &Path, dst: &Path) -> io::Result<()> {
+        ::std::os::windows::fs::symlink_file(src, dst)
+    }
+
+    fn set_ownerships(_: &Path, _: &Option<&mut std::fs::File>, _: u64, _: u64) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn set_perms(
+        dst: &Path,
+        f: Option<&mut std::fs::File>,
+        mode: u32,
+        _preserve: bool,
+    ) -> io::Result<()> {
+        if mode & 0o200 == 0o200 {
+            return Ok(());
+        }
+        match f {
+            Some(f) => {
+                let mut perm = f.metadata()?.permissions();
+                perm.set_readonly(true);
+                f.set_permissions(perm)
+            }
+            None => {
+                let mut perm = fs::metadata(dst)?.permissions();
+                perm.set_readonly(true);
+                fs::set_permissions(dst, perm)
+            }
         }
     }
 }
