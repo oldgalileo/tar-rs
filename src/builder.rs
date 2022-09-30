@@ -158,7 +158,7 @@ impl<W: Write> Builder<W> {
     /// let mut data: &[u8] = &[1, 2, 3, 4];
     ///
     /// let mut ar = Builder::new(Vec::new());
-    /// ar.append_data(&mut header, "really/long/path/to/foo", data).unwrap();
+    /// ar.append_data(&mut header, data, "really/long/path/to/foo").unwrap();
     /// let data = ar.into_inner().unwrap();
     /// ```
     pub fn append_data<P: AsRef<Path>, R: Read>(
@@ -453,43 +453,6 @@ impl<W: Write> Builder<W> {
         self.append(&mut header, reader)
     }
 
-    /// Adds a directory to this archive with the given path as the name of the
-    /// directory in the archive.
-    ///
-    /// This will use `stat` to populate a `Header`, and it will then append the
-    /// directory to the archive with the name `path`.
-    ///
-    /// Note that this will not attempt to seek the archive to a valid position,
-    /// so if the archive is in the middle of a read or some other similar
-    /// operation then this may corrupt the archive.
-    ///
-    /// Note this will not add the contents of the directory to the archive.
-    /// See `append_dir_all` for recusively adding the contents of the directory.
-    ///
-    /// Also note that after all files have been written to an archive the
-    /// `finish` function needs to be called to finish writing the archive.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::fs;
-    /// use tar::Builder;
-    ///
-    /// let mut ar = Builder::new(Vec::new());
-    ///
-    /// // Use the directory at one location, but insert it into the archive
-    /// // with a different name.
-    /// ar.append_dir("bardir", ".").unwrap();
-    /// ```
-    // pub fn append_dir<P, Q>(&mut self, src: P, dest: Q) -> io::Result<()>
-    // where
-    //     P: AsRef<Path>,
-    //     Q: AsRef<Path>,
-    // {
-    //     let mode = self.mode.clone();
-    //     append_dir(self.get_mut(), dest.as_ref(), src.as_ref(), mode)
-    // }
-
     /// Adds a directory and all of its contents (recursively) to this archive
     /// with the given path as the name of the directory in the archive.
     ///
@@ -502,7 +465,7 @@ impl<W: Write> Builder<W> {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```no_run
     /// use std::fs;
     /// use tar::Builder;
     ///

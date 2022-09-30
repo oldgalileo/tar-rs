@@ -53,8 +53,10 @@ fn main() {
     let file = File::create("foo.tar").unwrap();
     let mut a = Builder::new(file);
 
+    // Appends file at path `file1.txt` to archive
     a.append_path("file1.txt").unwrap();
-    a.append_file("file2.txt", &mut File::open("file3.txt").unwrap()).unwrap();
+    // Appends file at path `file3.txt` to archive with name `file2.txt`
+    a.append_file("file3.txt", "file2.txt").unwrap();
 }
 ```
 
