@@ -263,6 +263,11 @@ impl<'a, R: Read> Entry<'a, R> {
     pub fn set_preserve_mtime(&mut self, preserve: bool) {
         self.fields.preserve_mtime = preserve;
     }
+
+    /// Document me
+    pub fn set_preserve_ownership(&mut self, preserve: bool) {
+        self.fields.preserve_ownerships = preserve;
+    }
 }
 
 impl<'a, R: Read> Read for Entry<'a, R> {

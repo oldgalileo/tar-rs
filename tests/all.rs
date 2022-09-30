@@ -137,7 +137,7 @@ fn writing_files() {
     let path = td.path().join("test");
     t!(t!(File::create(&path)).write_all(b"test"));
 
-    t!(ar.append_file("test2", &mut t!(File::open(&path))));
+    t!(ar.append_file(path, "test2"));
 
     let data = t!(ar.into_inner());
     let mut ar = Archive::new(Cursor::new(data));
@@ -168,8 +168,8 @@ fn large_filename() {
     header.set_cksum();
     t!(ar.append(&header, &b"test"[..]));
     let too_long = repeat("abcd").take(200).collect::<String>();
-    t!(ar.append_file(&too_long, &mut t!(File::open(&path))));
-    t!(ar.append_data(&mut header, &too_long, &b"test"[..]));
+    t!(ar.append_file(&path, &too_long));
+    t!(ar.append_data(&mut header, &b"test"[..], &too_long));
 
     let rd = Cursor::new(t!(ar.into_inner()));
     let mut ar = Archive::new(rd);
@@ -409,9 +409,9 @@ fn writing_and_extracting_directories() {
     let mut ar = Builder::new(Vec::new());
     let tmppath = td.path().join("tmpfile");
     t!(t!(File::create(&tmppath)).write_all(b"c"));
-    t!(ar.append_dir("a", "."));
-    t!(ar.append_dir("a/b", "."));
-    t!(ar.append_file("a/c", &mut t!(File::open(&tmppath))));
+    t!(ar.append_directory(".", "a"));
+    t!(ar.append_directory(".", "a/b"));
+    t!(ar.append_file(&tmppath, "a/c"));
     t!(ar.finish());
 
     let rdr = Cursor::new(t!(ar.into_inner()));
@@ -665,12 +665,12 @@ fn extracting_malformed_tar_null_blocks() {
     let path2 = td.path().join("tmpfile2");
     t!(File::create(&path1));
     t!(File::create(&path2));
-    t!(ar.append_file("tmpfile1", &mut t!(File::open(&path1))));
+    t!(ar.append_file(&path1, "tmpfile1"));
     let mut data = t!(ar.into_inner());
     let amt = data.len();
     data.truncate(amt - 512);
     let mut ar = Builder::new(data);
-    t!(ar.append_file("tmpfile2", &mut t!(File::open(&path2))));
+    t!(ar.append_file(&path2, "tmpfile2"));
     t!(ar.finish());
 
     let data = t!(ar.into_inner());
@@ -728,7 +728,7 @@ fn backslash_treated_well() {
     // Insert a file into an archive with a backslash
     let td = t!(TempBuilder::new().prefix("tar-rs").tempdir());
     let mut ar = Builder::new(Vec::<u8>::new());
-    t!(ar.append_dir("foo\\bar", td.path()));
+    t!(ar.append_directory(td.path(), "foo\\bar"));
     let mut ar = Archive::new(Cursor::new(t!(ar.into_inner())));
     let f = t!(t!(ar.entries()).next().unwrap());
     if cfg!(unix) {
@@ -766,7 +766,7 @@ fn nul_bytes_in_path() {
     let nul_path = OsStr::from_bytes(b"foo\0");
     let td = t!(TempBuilder::new().prefix("tar-rs").tempdir());
     let mut ar = Builder::new(Vec::<u8>::new());
-    let err = ar.append_dir(nul_path, td.path()).unwrap_err();
+    let err = ar.append_directory(td.path(), nul_path).unwrap_err();
     assert!(err.to_string().contains("contains a nul byte"));
 }
 
@@ -927,7 +927,8 @@ fn long_linkname_gnu() {
         h.set_size(0);
         let path = "usr/lib/.build-id/05/159ed904e45ff5100f7acd3d3b99fa7e27e34f";
         let target = "../../../../usr/lib64/qt5/plugins/wayland-graphics-integration-server/libqt-wayland-compositor-xcomposite-egl.so";
-        t!(b.append_link(&mut h, path, target));
+
+        t!(b.append_link_with_header(target, path, &mut h));
 
         let contents = t!(b.into_inner());
         let mut a = Archive::new(&contents[..]);
@@ -949,7 +950,7 @@ fn linkname_literal() {
         let path = "usr/lib/systemd/systemd-sysv-install";
         let target = "../../..//sbin/chkconfig";
         h.set_link_name_literal(target).unwrap();
-        t!(b.append_data(&mut h, path, std::io::empty()));
+        t!(b.append_data(&mut h, std::io::empty(), path));
 
         let contents = t!(b.into_inner());
         let mut a = Archive::new(&contents[..]);
@@ -970,7 +971,7 @@ fn encoded_long_name_has_trailing_nul() {
     let mut b = Builder::new(Vec::<u8>::new());
     let long = repeat("abcd").take(200).collect::<String>();
 
-    t!(b.append_file(&long, &mut t!(File::open(&path))));
+    t!(b.append_file(&path, &long));
 
     let contents = t!(b.into_inner());
     let mut a = Archive::new(&contents[..]);
@@ -1113,8 +1114,8 @@ fn path_separators() {
 
     // Make sure GNU headers normalize to Unix path separators,
     // including the `@LongLink` fallback used by `append_file`.
-    t!(ar.append_file(&short_path, &mut t!(File::open(&path))));
-    t!(ar.append_file(&long_path, &mut t!(File::open(&path))));
+    t!(ar.append_file(&path, &short_path));
+    t!(ar.append_file(&path, &long_path));
 
     let rd = Cursor::new(t!(ar.into_inner()));
     let mut ar = Archive::new(rd);
@@ -1286,7 +1287,7 @@ fn append_long_multibyte() {
     for _ in 0..512 {
         name.push('a');
         name.push('𑢮');
-        x.append_data(&mut Header::new_gnu(), &name, data).unwrap();
+        x.append_data(&mut Header::new_gnu(), data, &name).unwrap();
         name.pop();
     }
 }
