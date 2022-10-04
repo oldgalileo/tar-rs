@@ -27,23 +27,23 @@ pub struct Entry<'a, R: 'a + Read> {
 
 // private implementation detail of `Entry`, but concrete (no type parameters)
 // and also all-public to be constructed from other modules.
-pub struct EntryFields<'a> {
-    pub long_pathname: Option<Vec<u8>>,
-    pub long_linkname: Option<Vec<u8>>,
-    pub pax_extensions: Option<Vec<u8>>,
-    pub header: Header,
-    pub size: u64,
-    pub header_pos: u64,
-    pub file_pos: u64,
-    pub data: Vec<EntryIo<'a>>,
-    pub unpack_xattrs: bool,
-    pub preserve_permissions: bool,
-    pub preserve_ownerships: bool,
-    pub preserve_mtime: bool,
-    pub overwrite: bool,
+pub(crate) struct EntryFields<'a> {
+    pub(crate) long_pathname: Option<Vec<u8>>,
+    pub(crate) long_linkname: Option<Vec<u8>>,
+    pub(crate) pax_extensions: Option<Vec<u8>>,
+    pub(crate) header: Header,
+    pub(crate) size: u64,
+    pub(crate) header_pos: u64,
+    pub(crate) file_pos: u64,
+    pub(crate) data: Vec<EntryIo<'a>>,
+    pub(crate) unpack_xattrs: bool,
+    pub(crate) preserve_permissions: bool,
+    pub(crate) preserve_ownerships: bool,
+    pub(crate) preserve_mtime: bool,
+    pub(crate) overwrite: bool,
 }
 
-pub enum EntryIo<'a> {
+pub(crate) enum EntryIo<'a> {
     Pad(io::Take<io::Repeat>),
     Data(io::Take<&'a ArchiveInner<dyn Read + 'a>>),
 }
@@ -277,18 +277,18 @@ impl<'a, R: Read> Read for Entry<'a, R> {
 }
 
 impl<'a> EntryFields<'a> {
-    pub fn from<R: Read>(entry: Entry<R>) -> EntryFields {
+    pub(crate) fn from<R: Read>(entry: Entry<R>) -> EntryFields {
         entry.fields
     }
 
-    pub fn into_entry<R: Read>(self) -> Entry<'a, R> {
+    pub(crate) fn into_entry<R: Read>(self) -> Entry<'a, R> {
         Entry {
             fields: self,
             _ignored: marker::PhantomData,
         }
     }
 
-    pub fn read_all(&mut self) -> io::Result<Vec<u8>> {
+    pub(crate) fn read_all(&mut self) -> io::Result<Vec<u8>> {
         // Preallocate some data but don't let ourselves get too crazy now.
         let cap = cmp::min(self.size, 128 * 1024);
         let mut v = Vec::with_capacity(cap as usize);
@@ -632,17 +632,17 @@ impl<'a> EntryFields<'a> {
 
         // Ensure we write a new file rather than overwriting in-place which
         // is attackable; if an existing file is found unlink it.
-        fn open(dst: &Path) -> io::Result<std::fs::File> {
-            OpenOptions::new().write(true).create_new(true).open(dst)
-        }
+        let mut file_opts = OpenOptions::new();
+        file_opts.write(true).create_new(true);
+
         let mut f = (|| -> io::Result<std::fs::File> {
-            let mut f = open(dst).or_else(|err| {
+            let mut f = file_opts.open(dst).or_else(|err| {
                 if err.kind() != ErrorKind::AlreadyExists {
                     Err(err)
                 } else if self.overwrite {
                     match fs::remove_file(dst) {
-                        Ok(()) => open(dst),
-                        Err(ref e) if e.kind() == io::ErrorKind::NotFound => open(dst),
+                        Ok(()) => file_opts.open(dst),
+                        Err(ref e) if e.kind() == io::ErrorKind::NotFound => file_opts.open(dst),
                         Err(e) => Err(e),
                     }
                 } else {

@@ -30,6 +30,7 @@ pub struct PaxExtension<'entry> {
     value: &'entry [u8],
 }
 
+/// TODO
 pub fn pax_extensions_size(a: &[u8]) -> Option<u64> {
     for extension in PaxExtensions::new(a) {
         let current_extension = match extension {

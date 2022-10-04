@@ -782,19 +782,7 @@ impl Header {
         // [1]: https://github.com/alexcrichton/tar-rs/issues/70
 
         // TODO: need to bind more file types
-        self.set_entry_type(entry_type(meta.mode()));
-
-        fn entry_type(mode: u32) -> EntryType {
-            match mode as libc::mode_t & libc::S_IFMT {
-                libc::S_IFREG => EntryType::file(),
-                libc::S_IFLNK => EntryType::symlink(),
-                libc::S_IFCHR => EntryType::character_special(),
-                libc::S_IFBLK => EntryType::block_special(),
-                libc::S_IFDIR => EntryType::dir(),
-                libc::S_IFIFO => EntryType::fifo(),
-                _ => EntryType::new(b' '),
-            }
-        }
+        self.set_entry_type(mode_to_entry_type(meta.mode()));
     }
 
     #[cfg(windows)]
@@ -1639,4 +1627,17 @@ pub fn bytes2path(bytes: Cow<[u8]>) -> io::Result<Cow<Path>> {
 #[cfg(target_arch = "wasm32")]
 fn invalid_utf8<T>(_: T) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "Invalid utf-8")
+}
+
+#[cfg(unix)]
+fn mode_to_entry_type(mode: u32) -> EntryType {
+    match mode as libc::mode_t & libc::S_IFMT {
+        libc::S_IFREG => EntryType::file(),
+        libc::S_IFLNK => EntryType::symlink(),
+        libc::S_IFCHR => EntryType::character_special(),
+        libc::S_IFBLK => EntryType::block_special(),
+        libc::S_IFDIR => EntryType::dir(),
+        libc::S_IFIFO => EntryType::fifo(),
+        _ => EntryType::new(b' '),
+    }
 }

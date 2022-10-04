@@ -24,11 +24,14 @@
 use std::io::{Error, ErrorKind};
 
 pub use crate::archive::{Archive, Entries};
-pub use crate::builder::Builder;
+pub use crate::builder::prepare_header_path;
+pub use crate::builder::{Builder, LinkInfo};
 pub use crate::entry::{Entry, Unpacked};
 pub use crate::entry_type::EntryType;
 pub use crate::header::GnuExtSparseHeader;
+pub use crate::header::{bytes2path, path2bytes};
 pub use crate::header::{GnuHeader, GnuSparseHeader, Header, HeaderMode, OldHeader, UstarHeader};
+pub use crate::pax::pax_extensions_size;
 pub use crate::pax::{PaxExtension, PaxExtensions};
 
 mod archive;

@@ -79,7 +79,7 @@ impl<R: Read> Archive<R> {
     pub fn entries(&mut self) -> io::Result<Entries<R>> {
         let me: &mut Archive<dyn Read> = self;
         me._entries(None).map(|fields| Entries {
-            fields: fields,
+            fields,
             _ignored: marker::PhantomData,
         })
     }
@@ -171,7 +171,7 @@ impl<R: Seek + Read> Archive<R> {
         let me: &Archive<dyn Read> = self;
         let me_seekable: &Archive<dyn SeekRead> = self;
         me._entries(Some(me_seekable)).map(|fields| Entries {
-            fields: fields,
+            fields,
             _ignored: marker::PhantomData,
         })
     }
@@ -238,10 +238,7 @@ impl<'a, R: Read> Entries<'a, R> {
     /// or long link archive members. Raw iteration is disabled by default.
     pub fn raw(self, raw: bool) -> Entries<'a, R> {
         Entries {
-            fields: EntriesFields {
-                raw: raw,
-                ..self.fields
-            },
+            fields: EntriesFields { raw, ..self.fields },
             _ignored: marker::PhantomData,
         }
     }
@@ -307,11 +304,11 @@ impl<'a> EntriesFields<'a> {
             }
         }
         let ret = EntryFields {
-            size: size,
-            header_pos: header_pos,
-            file_pos: file_pos,
+            size,
+            header_pos,
+            file_pos,
             data: vec![EntryIo::Data((&self.archive.inner).take(size))],
-            header: header,
+            header,
             long_pathname: None,
             long_linkname: None,
             pax_extensions: None,

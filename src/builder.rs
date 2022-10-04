@@ -10,8 +10,11 @@ use crate::header::{path2bytes, HeaderMode};
 use crate::{other, EntryType, Header};
 
 #[derive(Eq, Hash, PartialEq)]
+/// TODO
 pub struct LinkInfo {
+    /// TODO
     pub device: u64,
+    /// TODO
     pub inode: u64,
 }
 
@@ -594,6 +597,7 @@ fn prepare_header(size: u64, entry_type: EntryType) -> Header {
     header
 }
 
+/// TODO
 pub fn prepare_header_path(
     dst: &mut dyn Write,
     header: &mut Header,
