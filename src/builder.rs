@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::str;
 
 use crate::header::{path2bytes, HeaderMode};
+use crate::meta::Metadata;
 use crate::{other, EntryType, Header};
 
 #[derive(Eq, Hash, PartialEq)]
@@ -185,8 +186,18 @@ impl<W: Write> Builder<W> {
     ) -> io::Result<()> {
         let stat = fs::symlink_metadata(&path)?;
         let target = fs::read_link(&path)?;
+        self.append_link_with_metadata(target, name, &stat.into())
+    }
+
+    /// TODO: Document
+    pub fn append_link_with_metadata<P: AsRef<Path>, Q: AsRef<Path>>(
+        &mut self,
+        target: P,
+        name: Q,
+        meta: &Metadata,
+    ) -> io::Result<()> {
         let mut header = Header::new_gnu();
-        header.set_metadata_in_mode(&stat, self.mode);
+        header.set_metadata_in_mode(meta, self.mode);
         self.append_link_with_header(target, name, &mut header)
     }
 
@@ -360,7 +371,7 @@ impl<W: Write> Builder<W> {
             );
             let mut header = Header::new_gnu();
             prepare_header_path(self.get_mut(), &mut header, dest.as_ref())?;
-            header.set_metadata_in_mode(&stat, self.mode);
+            header.set_metadata_in_mode(&stat.into(), self.mode);
             header.set_entry_type(EntryType::Link);
 
             tracing::debug!(
@@ -390,7 +401,66 @@ impl<W: Write> Builder<W> {
             return self.append(&header, &mut io::empty());
         }
 
-        self.append_data_with_meta(&dest, &stat, &mut fs::File::open(src)?)
+        self.append_data_with_metadata(&dest, &stat.into(), &mut fs::File::open(src)?)
+    }
+
+    /// TODO
+    pub fn append_file_with_metadata<P: AsRef<Path>, Q: AsRef<Path>>(
+        &mut self,
+        src: P,
+        dest: Q,
+        meta: &Metadata,
+    ) -> io::Result<()> {
+        let mode = self.mode.clone();
+        let stat = std::fs::metadata(&src)?;
+        #[cfg(unix)]
+        {
+            if !stat.is_file() {
+                return append_special(self.get_mut(), dest, &stat, mode);
+            }
+        }
+        if let Some(link_name) = self.check_for_hard_link(dest.as_ref(), &stat) {
+            let mut header = Header::new_gnu();
+            prepare_header_path(self.get_mut(), &mut header, dest.as_ref())?;
+            header.set_metadata_in_mode(meta, self.mode);
+            header.set_entry_type(EntryType::Link);
+
+            tracing::debug!(
+                "about to prepare header link with `{:?}` (starting from: `{:?}`",
+                link_name,
+                header
+            );
+
+            prepare_header_link(
+                self.get_mut(),
+                &mut header,
+                link_name.as_ref(),
+                EntryType::Link,
+            )?;
+
+            tracing::debug!(
+                "finishing preparing header link w `{:?}` (type: `{:?}`) (finishing at: `{:?}`)",
+                link_name,
+                header,
+                header.entry_type()
+            );
+            header.set_size(0);
+            header.set_cksum();
+
+            tracing::debug!("ading hardlink with header `{:?}`", header);
+            tracing::debug!("-------");
+            return self.append(&header, &mut io::empty());
+        }
+
+        let meta = Metadata {
+            size: stat.len(),
+            uid: meta.uid,
+            gid: meta.gid,
+            mode: meta.mode,
+            mtime: meta.mtime,
+            entry_type: Metadata::from(stat).entry_type,
+        };
+        self.append_data_with_metadata(&dest, &meta, &mut fs::File::open(src)?)
     }
 
     // Windows does not support using inode to check for hard link
@@ -439,14 +509,23 @@ impl<W: Write> Builder<W> {
         dest: Q,
     ) -> io::Result<()> {
         let stat = fs::metadata(src.as_ref())?;
-        self.append_data_with_meta(dest, &stat, &mut io::empty())
+        self.append_directory_with_metadata(dest, &stat.into())
     }
 
     /// TODO: Document
-    pub fn append_data_with_meta<P: AsRef<Path>>(
+    pub fn append_directory_with_metadata<P: AsRef<Path>>(
         &mut self,
         dest: P,
-        meta: &fs::Metadata,
+        meta: &Metadata,
+    ) -> io::Result<()> {
+        self.append_data_with_metadata(dest, meta, &mut io::empty())
+    }
+
+    /// TODO: Document
+    pub fn append_data_with_metadata<P: AsRef<Path>>(
+        &mut self,
+        dest: P,
+        meta: &Metadata,
         reader: &mut dyn Read,
     ) -> io::Result<()> {
         let mut header = Header::new_gnu();
@@ -566,7 +645,7 @@ fn append_special<P: AsRef<Path>>(
     }
 
     let mut header = Header::new_gnu();
-    header.set_metadata_in_mode(stat, mode);
+    header.set_metadata_in_mode(&Metadata::from(stat), mode);
     prepare_header_path(dst, &mut header, name.as_ref())?;
 
     header.set_entry_type(entry_type);

@@ -31,6 +31,7 @@ pub use crate::entry_type::EntryType;
 pub use crate::header::GnuExtSparseHeader;
 pub use crate::header::{bytes2path, path2bytes};
 pub use crate::header::{GnuHeader, GnuSparseHeader, Header, HeaderMode, OldHeader, UstarHeader};
+pub use crate::meta::Metadata;
 pub use crate::pax::pax_extensions_size;
 pub use crate::pax::{PaxExtension, PaxExtensions};
 
@@ -40,6 +41,7 @@ mod entry;
 mod entry_type;
 mod error;
 mod header;
+mod meta;
 mod pax;
 
 fn other(msg: &str) -> Error {

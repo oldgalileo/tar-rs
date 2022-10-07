@@ -5,7 +5,6 @@ use std::os::windows::prelude::*;
 
 use std::borrow::Cow;
 use std::fmt;
-use std::fs;
 use std::io;
 use std::iter;
 use std::iter::repeat;
@@ -13,6 +12,7 @@ use std::mem;
 use std::path::{Component, Path, PathBuf};
 use std::str;
 
+use crate::meta::Metadata;
 use crate::other;
 use crate::EntryType;
 
@@ -254,6 +254,11 @@ impl Header {
         }
     }
 
+    // pub fn metadata(&self) -> fs::Metadata {
+    //     let metadata = fs::metadata
+    //     metadata
+    // }
+
     /// Treats the given byte slice as a header.
     ///
     /// Panics if the length of the passed slice is not equal to 512.
@@ -279,13 +284,13 @@ impl Header {
     /// This is useful for initializing a `Header` from the OS's metadata from a
     /// file. By default, this will use `HeaderMode::Complete` to include all
     /// metadata.
-    pub fn set_metadata(&mut self, meta: &fs::Metadata) {
+    pub fn set_metadata(&mut self, meta: &Metadata) {
         self.fill_from(meta, HeaderMode::Complete);
     }
 
     /// Sets only the metadata relevant to the given HeaderMode in this header
     /// from the metadata argument provided.
-    pub fn set_metadata_in_mode(&mut self, meta: &fs::Metadata, mode: HeaderMode) {
+    pub fn set_metadata_in_mode(&mut self, meta: &Metadata, mode: HeaderMode) {
         self.fill_from(meta, mode);
     }
 
@@ -714,14 +719,16 @@ impl Header {
             .fold(0, |a, b| a + (*b as u32))
     }
 
-    fn fill_from(&mut self, meta: &fs::Metadata, mode: HeaderMode) {
+    fn fill_from(&mut self, meta: &Metadata, mode: HeaderMode) {
         self.fill_platform_from(meta, mode);
         // Set size of directories to zero
-        self.set_size(if meta.is_dir() || meta.file_type().is_symlink() {
-            0
-        } else {
-            meta.len()
-        });
+        self.set_size(
+            if meta.entry_type.is_dir() || meta.entry_type.is_symlink() {
+                0
+            } else {
+                meta.size
+            },
+        );
         if let Some(ustar) = self.as_ustar_mut() {
             ustar.set_device_major(0);
             ustar.set_device_minor(0);
@@ -739,13 +746,13 @@ impl Header {
     }
 
     #[cfg(unix)]
-    fn fill_platform_from(&mut self, meta: &fs::Metadata, mode: HeaderMode) {
+    fn fill_platform_from(&mut self, meta: &Metadata, mode: HeaderMode) {
         match mode {
             HeaderMode::Complete => {
-                self.set_mtime(meta.mtime() as u64);
-                self.set_uid(meta.uid() as u64);
-                self.set_gid(meta.gid() as u64);
-                self.set_mode(meta.mode() as u32);
+                self.set_mtime(meta.mtime);
+                self.set_uid(meta.uid);
+                self.set_gid(meta.gid);
+                self.set_mode(meta.mode);
             }
             HeaderMode::Deterministic => {
                 // We could in theory set the mtime to zero here, but not all
@@ -763,7 +770,7 @@ impl Header {
                 self.set_gid(0);
 
                 // Use a default umask value, but propagate the (user) execute bit.
-                let fs_mode = if meta.is_dir() || (0o100 & meta.mode() == 0o100) {
+                let fs_mode = if meta.entry_type.is_dir() || (0o100 & meta.mode == 0o100) {
                     0o755
                 } else {
                     0o644
@@ -782,7 +789,7 @@ impl Header {
         // [1]: https://github.com/alexcrichton/tar-rs/issues/70
 
         // TODO: need to bind more file types
-        self.set_entry_type(mode_to_entry_type(meta.mode()));
+        self.set_entry_type(meta.entry_type);
     }
 
     #[cfg(windows)]
@@ -792,43 +799,23 @@ impl Header {
             HeaderMode::Complete => {
                 self.set_uid(0);
                 self.set_gid(0);
-                // The dates listed in tarballs are always seconds relative to
-                // January 1, 1970. On Windows, however, the timestamps are returned as
-                // dates relative to January 1, 1601 (in 100ns intervals), so we need to
-                // add in some offset for those dates.
-                let mtime = (meta.last_write_time() / (1_000_000_000 / 100)) - 11644473600;
-                self.set_mtime(mtime);
-                let fs_mode = {
-                    const FILE_ATTRIBUTE_READONLY: u32 = 0x00000001;
-                    let readonly = meta.file_attributes() & FILE_ATTRIBUTE_READONLY;
-                    match (meta.is_dir(), readonly != 0) {
-                        (true, false) => 0o755,
-                        (true, true) => 0o555,
-                        (false, false) => 0o644,
-                        (false, true) => 0o444,
-                    }
-                };
-                self.set_mode(fs_mode);
+                self.set_mtime(meta.mtime);
+                self.set_mode(meta.mode);
             }
             HeaderMode::Deterministic => {
                 self.set_uid(0);
                 self.set_gid(0);
-                self.set_mtime(123456789); // see above in unix
-                let fs_mode = if meta.is_dir() { 0o755 } else { 0o644 };
+                self.set_mtime(1153704088); // see above in unix
+                let fs_mode = if meta.entry_type.is_dir() {
+                    0o755
+                } else {
+                    0o644
+                };
                 self.set_mode(fs_mode);
             }
         }
 
-        let ft = meta.file_type();
-        self.set_entry_type(if ft.is_dir() {
-            EntryType::dir()
-        } else if ft.is_file() {
-            EntryType::file()
-        } else if ft.is_symlink() {
-            EntryType::symlink()
-        } else {
-            EntryType::new(b' ')
-        });
+        self.set_entry_type(meta.entry_type);
     }
 
     fn debug_fields(&self, b: &mut fmt::DebugStruct) {
@@ -1627,17 +1614,4 @@ pub fn bytes2path(bytes: Cow<[u8]>) -> io::Result<Cow<Path>> {
 #[cfg(target_arch = "wasm32")]
 fn invalid_utf8<T>(_: T) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "Invalid utf-8")
-}
-
-#[cfg(unix)]
-fn mode_to_entry_type(mode: u32) -> EntryType {
-    match mode as libc::mode_t & libc::S_IFMT {
-        libc::S_IFREG => EntryType::file(),
-        libc::S_IFLNK => EntryType::symlink(),
-        libc::S_IFCHR => EntryType::character_special(),
-        libc::S_IFBLK => EntryType::block_special(),
-        libc::S_IFDIR => EntryType::dir(),
-        libc::S_IFIFO => EntryType::fifo(),
-        _ => EntryType::new(b' '),
-    }
 }
